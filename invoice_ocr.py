@@ -1,5 +1,9 @@
 import pygame
 import sys
+import os
+import json
+import subprocess
+import tempfile
 import numpy as np
 from PIL import Image
 import pyperclip
@@ -677,6 +681,52 @@ class RectSelector:
                 status.set(f'Copied cell: "{val}"')
 
         tree.bind('<Double-1>', on_dbl)
+
+        # ── JSON export & matcher launch ──────────────────────────────────
+        def export_json():
+            path = filedialog.asksaveasfilename(
+                title="Export OCR JSON",
+                defaultextension='.json',
+                filetypes=[('JSON', '*.json'), ('All', '*.*')],
+                initialfile='invoice_ocr.json',
+                parent=root,
+            )
+            if not path:
+                return
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(table, f, ensure_ascii=False, indent=2)
+            status.set(f"Exported {len(table)} rows → {os.path.basename(path)}")
+
+        def send_to_matcher():
+            tmp = tempfile.mktemp(suffix='.json', prefix='ocr_invoice_')
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(table, f, ensure_ascii=False, indent=2)
+            matcher = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'invoice_matching.py')
+            subprocess.Popen([sys.executable, matcher, '--json', tmp])
+            status.set(f"Launched matcher with {len(table)} row(s).")
+
+        xframe = tk.Frame(root, bg='#f4f4f4', pady=4)
+        xframe.pack(fill='x')
+        tk.Button(xframe, text="Export JSON",
+                  command=export_json,
+                  font=('Segoe UI', 10, 'bold'),
+                  fg='white', bg='#7d3c98',
+                  activeforeground='white', activebackground='#6c3483',
+                  relief='flat', padx=14, pady=4, cursor='hand2', bd=0,
+                  ).pack(side='left', padx=(10, 4))
+        tk.Button(xframe, text="Send to Matcher",
+                  command=send_to_matcher,
+                  font=('Segoe UI', 10, 'bold'),
+                  fg='white', bg='#1a6aa0',
+                  activeforeground='white', activebackground='#154f78',
+                  relief='flat', padx=14, pady=4, cursor='hand2', bd=0,
+                  ).pack(side='left', padx=4)
+        tk.Label(xframe,
+                 text="Export JSON → load in Matcher  |  Send to Matcher → opens Matcher directly",
+                 font=('Segoe UI', 9, 'italic'), fg='#888', bg='#f4f4f4',
+                 ).pack(side='left', padx=10)
+
         root.mainloop()
 
     # ── toolbar ────────────────────────────────────────────────────────────

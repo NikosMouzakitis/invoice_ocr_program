@@ -557,4 +557,18 @@ class MatcherApp(tk.Tk):
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    MatcherApp().mainloop()
+    import argparse
+    ap = argparse.ArgumentParser(description="Invoice → ERP Matcher")
+    ap.add_argument('--json', dest='json_file', default=None,
+                    help="Path to OCR JSON file to load on startup")
+    args, _ = ap.parse_known_args()
+
+    app = MatcherApp()
+    if args.json_file and os.path.exists(args.json_file):
+        try:
+            with open(args.json_file, encoding='utf-8') as f:
+                data = json.load(f)
+            app._apply_rows(data)
+        except Exception as e:
+            print(f"[matcher] Could not load {args.json_file}: {e}")
+    app.mainloop()
