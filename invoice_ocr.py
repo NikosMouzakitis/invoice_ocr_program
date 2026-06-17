@@ -14,7 +14,7 @@ import threading
 
 SCREEN_WIDTH  = 1200
 SCREEN_HEIGHT = 800
-TOOLBAR_H     = 44
+TOOLBAR_H     = 52
 IMG_AREA_H    = SCREEN_HEIGHT - TOOLBAR_H
 
 WHITE      = (255, 255, 255)
@@ -23,18 +23,30 @@ LIGHT_GRAY = (210, 210, 210)
 YELLOW     = (255, 210,   0)
 CYAN       = (0,   200, 210)
 GREEN      = (60,  200,  80)
-TOOLBAR_BG = (38,  38,  38)
-BTN_NORMAL = (62,  62,  62)
-BTN_HOVER  = (95,  95,  95)
-BTN_TEXT   = (238, 238, 238)
-BTN_GREEN  = (40,  130,  60)
-BTN_GREEN_H= (55,  170,  75)
+TOOLBAR_BG = (22,  27,  36)
+BTN_NORMAL = (48,  54,  68)
+BTN_HOVER  = (68,  78,  98)
+BTN_TEXT   = (228, 233, 240)
+BTN_GREEN  = (30,  110,  50)
+BTN_GREEN_H= (42,  148,  65)
+BTN_BLUE   = (30,   82, 152)
+BTN_BLUE_H = (46,  112, 192)
+SEC_CLR    = (85,   95, 118)
 
 LABEL_COLORS = {
     'Description': (220,  50,  50),
     'Unit':        ( 30, 160,  60),
     'Price':       ( 30, 100, 210),
 }
+
+ROW_FILLS = [
+    (0, 200, 210, 30),   # even rows — teal
+    (120, 200, 255, 22), # odd rows  — blue
+]
+ROW_BORDERS = [
+    (0, 200, 210),
+    (90, 190, 255),
+]
 
 
 class RectSelector:
@@ -45,6 +57,7 @@ class RectSelector:
         self.clock  = pygame.time.Clock()
         self.font   = pygame.font.Font(None, 22)
         self.font_b = pygame.font.Font(None, 24)
+        self.font_s = pygame.font.Font(None, 17)
 
         self.image_path = None
         self.base_surf  = None
@@ -92,6 +105,8 @@ class RectSelector:
         # Displayed / OCR boundaries (derived from tight + row_height_add)
         self.row_boundaries    = []    # [(by1, by2)] base-image coords
         self.show_results      = False
+        self._detecting        = False
+        self._uniform_n        = 0     # >0 → use even division instead of detection bands
 
     # ── image / rotation ──────────────────────────────────────────────────
 
@@ -110,7 +125,14 @@ class RectSelector:
         self.image_path = path
         self.rotation   = 0.0
         try:
-            self._build_base(Image.open(path))
+            orig  = Image.open(path)
+            skew  = self._auto_deskew_angle(orig)
+            if abs(skew) > 0.05:
+                self.rotation = round(-skew, 1)
+                orig = orig.rotate(-self.rotation, expand=True,
+                                   resample=Image.Resampling.BICUBIC, fillcolor='white')
+                print(f"[auto-deskew] initial correction {self.rotation:+.1f}°")
+            self._build_base(orig)
             self.zoom, self.pan_x, self.pan_y = 1.0, 0.0, 0.0
             self._update_image_rect()
             self._reset_state()
@@ -141,6 +163,47 @@ class RectSelector:
                              resample=Image.Resampling.BICUBIC, fillcolor='white')
                 if self.rotation != 0 else orig)
         return full, full.width / self.base_pil.width, full.height / self.base_pil.height
+
+    # ── auto deskew ────────────────────────────────────────────────────────
+
+    def _auto_deskew_angle(self, pil_img):
+        """Detect document skew via Hough lines; returns degrees (clockwise-positive)."""
+        gray = np.array(pil_img.convert('L'))
+        h, w = gray.shape
+        scale = min(1.0, 1500 / max(w, h, 1))
+        if scale < 1.0:
+            gray = cv2.resize(gray, (int(w * scale), int(h * scale)))
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        min_len = max(40, int(gray.shape[1] * 0.12))
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
+                                 threshold=60, minLineLength=min_len, maxLineGap=15)
+        if lines is None:
+            return 0.0
+        angles = []
+        for x1, y1, x2, y2 in lines[:, 0]:
+            dx, dy = x2 - x1, y2 - y1
+            if abs(dx) < 1:
+                continue
+            ang = np.degrees(np.arctan2(dy, dx))
+            if abs(ang) < 20:
+                angles.append(ang)
+        if not angles:
+            return 0.0
+        angle = float(np.median(angles))
+        print(f"[auto-deskew] detected {angle:+.2f}°")
+        return angle
+
+    def _apply_auto_deskew(self):
+        """Re-detect skew from current base image and apply incremental correction."""
+        if self.base_pil is None:
+            return
+        skew = self._auto_deskew_angle(self.base_pil)
+        correction = round(-skew, 1)
+        if abs(correction) > 0.05:
+            self._apply_rotation(correction)
+            print(f"[auto-deskew] applied correction {correction:+.1f}°")
+        else:
+            print("[auto-deskew] document appears straight")
 
     # ── zoom / pan ─────────────────────────────────────────────────────────
 
@@ -238,7 +301,7 @@ class RectSelector:
             print(f"Selected {label}: x {x1:.0f}→{x2:.0f}  y {y1:.0f}→{y2:.0f}")
             self.current_selection_index += 1
             if self.current_selection_index == len(self.selected_labels):
-                threading.Thread(target=self._run_ocr_then_show, daemon=True).start()
+                threading.Thread(target=self._detect_rows_only, daemon=True).start()
         else:
             print("Selection too small, try again.")
         self.dragging = False; self.drag_rect = None; self.drag_start = None
@@ -313,15 +376,17 @@ class RectSelector:
         for i, (y1, y2) in enumerate(tight_rows_base):
             new_y1 = y1 - extra
             new_y2 = y2 + extra
-            # Cap top edge
+            # Cap top edge — same rule for every row: midpoint to neighbour,
+            # or image boundary for the very first row.  Do NOT snap to total_y1
+            # because that absorbs any gap above the first item, making row 1 taller.
             if i == 0:
-                new_y1 = max(new_y1, total_y1)
+                new_y1 = max(new_y1, 0.0)
             else:
                 mid    = (tight_rows_base[i-1][1] + y1) / 2.0
                 new_y1 = max(new_y1, mid)
-            # Cap bottom edge
+            # Cap bottom edge — same rule: midpoint or image boundary
             if i == n - 1:
-                new_y2 = min(new_y2, total_y2)
+                new_y2 = min(new_y2, float(self.base_h))
             else:
                 mid    = (y2 + tight_rows_base[i+1][0]) / 2.0
                 new_y2 = min(new_y2, mid)
@@ -332,13 +397,107 @@ class RectSelector:
             result.append((new_y1, new_y2))
         return result
 
+    def _nudge_boundaries(self, boundaries, x1, x2):
+        """Expand each row edge outward if it lands on a dark pixel (base-image coords)."""
+        if not boundaries or self.base_pil is None:
+            return boundaries
+
+        gray = np.array(self.base_pil.convert('L'))
+        img_h, img_w = gray.shape
+        xi1 = max(0, int(x1))
+        xi2 = min(img_w, int(x2))
+        if xi2 <= xi1:
+            return boundaries
+
+        DARK      = 180   # pixels below this value are considered content
+        MAX_NUDGE = 8     # max extra pixels to push per edge
+
+        result = [list(b) for b in boundaries]
+        n = len(result)
+
+        for i in range(n):
+            y1, y2 = result[i]
+
+            # Top edge: slide upward while the edge row contains dark pixels
+            prev_bottom = result[i - 1][1] if i > 0 else 0.0
+            for _ in range(MAX_NUDGE):
+                ck = max(0, int(y1))
+                if ck >= img_h:
+                    break
+                if gray[ck, xi1:xi2].min() >= DARK:
+                    break                       # edge row is clear
+                new_y1 = y1 - 1.0
+                if new_y1 < prev_bottom:
+                    break                       # would overlap previous row
+                y1 = new_y1
+            result[i][0] = y1
+
+            # Bottom edge: slide downward while the edge row contains dark pixels
+            next_top = result[i + 1][0] if i < n - 1 else float(img_h - 1)
+            for _ in range(MAX_NUDGE):
+                ck = min(img_h - 1, int(y2))
+                if ck < 0:
+                    break
+                if gray[ck, xi1:xi2].min() >= DARK:
+                    break                       # edge row is clear
+                new_y2 = y2 + 1.0
+                if new_y2 > next_top:
+                    break                       # would overlap next row
+                y2 = new_y2
+            result[i][1] = y2
+
+        return [tuple(r) for r in result]
+
+    def _uniform_boundaries(self):
+        """Divide _tight_total_base evenly into _uniform_n equal bands."""
+        y1, y2 = self._tight_total_base
+        step = (y2 - y1) / self._uniform_n
+        return [(y1 + i * step, y1 + (i + 1) * step)
+                for i in range(self._uniform_n)]
+
     def _update_row_boundaries(self):
-        """Recompute self.row_boundaries from stored tight rows + current row_height_add."""
+        """Recompute self.row_boundaries from stored state."""
         if not self._tight_rows_base:
             return
-        self.row_boundaries = self._apply_row_height(
+        if self._uniform_n > 0:
+            # Even division: detection only counted rows, bounds are split uniformly
+            self.row_boundaries = self._uniform_boundaries()
+            return
+        boundaries = self._apply_row_height(
             self._tight_rows_base, *self._tight_total_base
         )
+        if self.rectangles:
+            x1 = min(r[0] for r in self.rectangles)
+            x2 = max(r[2] for r in self.rectangles)
+            boundaries = self._nudge_boundaries(boundaries, x1, x2)
+        self.row_boundaries = boundaries
+
+    def _shift_rows(self, delta):
+        """Shift all row bands by delta base-image pixels (positive = down)."""
+        if not self._tight_rows_base:
+            return
+        if self._uniform_n > 0:
+            # Uniform mode: just shift the total bounds block and recompute
+            ty1, ty2 = self._tight_total_base
+            ty1 += delta
+            ty2 += delta
+            if ty1 < 0:
+                ty2 -= ty1; ty1 = 0.0
+            if ty2 > self.base_h:
+                ty1 -= (ty2 - self.base_h); ty2 = float(self.base_h)
+            self._tight_total_base = (ty1, ty2)
+        else:
+            shifted = [(y1 + delta, y2 + delta) for y1, y2 in self._tight_rows_base]
+            if shifted[0][0] < 0:
+                d = -shifted[0][0]
+                shifted = [(y1 + d, y2 + d) for y1, y2 in shifted]
+            if shifted[-1][1] > self.base_h:
+                d = shifted[-1][1] - self.base_h
+                shifted = [(y1 - d, y2 - d) for y1, y2 in shifted]
+            self._tight_rows_base = shifted
+            ty1, ty2 = self._tight_total_base
+            self._tight_total_base = (ty1 + delta, ty2 + delta)
+        self._update_row_boundaries()
 
     # ── OCR ────────────────────────────────────────────────────────────────
 
@@ -386,18 +545,36 @@ class RectSelector:
             print(row)
         return table
 
+    def _detect_rows_only(self):
+        """Count rows via detection, then divide selection evenly — no OCR."""
+        self._detecting = True
+        try:
+            full, sx, sy = self._get_full()
+            tight_orig = self._detect_rows(full, sx, sy)
+            n = len(tight_orig) if tight_orig else 1
+            print(f"[detect] {n} row(s) detected → dividing selection into {n} equal bands.")
+            self._tight_rows_base  = ([(r[0] / sy, r[1] / sy) for r in tight_orig]
+                                       if tight_orig
+                                       else [(self.locked_y1, self.locked_y2)])
+            self._tight_total_base = (self.locked_y1, self.locked_y2)
+            self._uniform_n        = n
+            self._update_row_boundaries()
+        finally:
+            self._detecting = False
+
     def _run_ocr_then_show(self):
-        """Initial run: detect rows, store tight bands, apply height, OCR, show."""
+        """Re-detect row count, divide selection evenly, then run OCR."""
         full, sx, sy = self._get_full()
 
         tight_orig = self._detect_rows(full, sx, sy)
-        if not tight_orig:
-            tight_orig = [(int(self.locked_y1*sy), int(self.locked_y2*sy))]
-        print(f"Detected {len(tight_orig)} tight row(s).")
+        n = len(tight_orig) if tight_orig else 1
+        print(f"[ocr] {n} row(s) → dividing selection into {n} equal bands.")
 
-        # Convert to base-image coords and store
-        self._tight_rows_base  = [(r[0]/sy, r[1]/sy) for r in tight_orig]
+        self._tight_rows_base  = ([(r[0]/sy, r[1]/sy) for r in tight_orig]
+                                   if tight_orig
+                                   else [(self.locked_y1, self.locked_y2)])
         self._tight_total_base = (self.locked_y1, self.locked_y2)
+        self._uniform_n        = n
         self._update_row_boundaries()
 
         table = self._ocr_from_boundaries(full, sx, sy)
@@ -504,12 +681,18 @@ class RectSelector:
 
     # ── toolbar ────────────────────────────────────────────────────────────
 
-    def _draw_btn(self, label, rect, hovered=False, green=False):
+    def _draw_btn(self, label, rect, hovered=False, green=False, blue=False):
         if green:
-            bg = BTN_GREEN_H if hovered else BTN_GREEN
+            bg  = BTN_GREEN_H if hovered else BTN_GREEN
+            bdr = (50, 160, 72) if hovered else (38, 130, 55)
+        elif blue:
+            bg  = BTN_BLUE_H if hovered else BTN_BLUE
+            bdr = (65, 135, 205) if hovered else (45, 100, 172)
         else:
-            bg = BTN_HOVER if hovered else BTN_NORMAL
-        pygame.draw.rect(self.screen, bg, rect, border_radius=4)
+            bg  = BTN_HOVER if hovered else BTN_NORMAL
+            bdr = (82, 92, 112) if hovered else (60, 68, 85)
+        pygame.draw.rect(self.screen, bg,  rect, border_radius=5)
+        pygame.draw.rect(self.screen, bdr, rect, 1, border_radius=5)
         s = self.font.render(label, True, BTN_TEXT)
         self.screen.blit(s, (rect.x + (rect.w - s.get_width())  // 2,
                               rect.y + (rect.h - s.get_height()) // 2))
@@ -518,75 +701,106 @@ class RectSelector:
         ty = SCREEN_HEIGHT - TOOLBAR_H
         pygame.draw.rect(self.screen, TOOLBAR_BG,
                          pygame.Rect(0, ty, SCREEN_WIDTH, TOOLBAR_H))
+        pygame.draw.line(self.screen, (50, 60, 80),
+                         (0, ty), (SCREEN_WIDTH, ty), 2)
 
         self._toolbar_btns = []
         bh = 28
-        by = ty + (TOOLBAR_H - bh) // 2
+        by = ty + TOOLBAR_H - bh - 6   # buttons near bottom
+        hy = ty + 5                      # section-header row
+
         x  = 10
         mx, my = mouse_pos
 
-        def btn(label, action, w=48, green=False):
+        def btn(label, action, w=40, green=False, blue=False):
             nonlocal x
-            r   = pygame.Rect(x, by, w, bh)
-            self._draw_btn(label, r, r.collidepoint(mx, my), green=green)
+            r = pygame.Rect(x, by, w, bh)
+            self._draw_btn(label, r, r.collidepoint(mx, my),
+                           green=green, blue=blue)
             self._toolbar_btns.append((r, action))
-            x  += w + 4
-
-        def lbl(text, color=(160, 160, 160)):
-            nonlocal x
-            s = self.font.render(text, True, color)
-            self.screen.blit(s, (x, by + (bh - s.get_height()) // 2))
-            x += s.get_width() + 6
+            x += w + 4
 
         def val(text, color):
             nonlocal x
             s = self.font_b.render(text, True, color)
             self.screen.blit(s, (x, by + (bh - s.get_height()) // 2))
-            x += s.get_width() + 10
+            x += s.get_width() + 8
+
+        def sec(label):
+            s = self.font_s.render(label, True, SEC_CLR)
+            self.screen.blit(s, (x, hy))
 
         def sep():
             nonlocal x
-            x += 6
-            pygame.draw.line(self.screen, (75, 75, 75), (x, by), (x, by + bh))
+            x += 8
+            pygame.draw.line(self.screen, (50, 60, 80),
+                             (x, ty + 4), (x, ty + TOOLBAR_H - 4))
             x += 10
 
-        # ── Rotation ─────────────────────────────────────────────────────
-        lbl("Rotation:")
-        for t, d in [("-5°",-5),("-1°",-1),("-0.1°",-0.1)]:
-            btn(t, ('rotate', d), w=44)
+        # ── ROTATION ─────────────────────────────────────────────────────
+        sec("ROTATION")
+        for t, d in [("-5°", -5), ("-1°", -1), ("-0.1°", -0.1)]:
+            btn(t, ('rotate', d), w=40)
         val(f"{self.rotation:+.1f}°", YELLOW)
-        for t, d in [("+0.1°",0.1),("+1°",1),("+5°",5)]:
-            btn(t, ('rotate', d), w=44)
+        for t, d in [("+0.1°", 0.1), ("+1°", 1), ("+5°", 5)]:
+            btn(t, ('rotate', d), w=40)
+        btn("Auto", ('auto_deskew', None), w=46, blue=True)
 
         sep()
 
-        # ── Row height ───────────────────────────────────────────────────
-        lbl("Row H:")
+        # ── ROW H ────────────────────────────────────────────────────────
+        sec("ROW H")
         btn("−", ('row_h', -2), w=26)
-        val(f"{self.row_height_add:+d} px", CYAN)
+        val(f"{self.row_height_add:+d}px", CYAN)
         btn("+", ('row_h', +2), w=26)
 
         sep()
 
-        # ── Row gap ──────────────────────────────────────────────────────
-        lbl("Gap:")
+        # ── GAP ──────────────────────────────────────────────────────────
+        sec("GAP")
         btn("−", ('pad', -1), w=26)
-        val(f"{self.row_pad} px", (200, 200, 100))
+        val(f"{self.row_pad}px", (200, 200, 100))
         btn("+", ('pad', +1), w=26)
 
         sep()
 
-        # ── Re-run OCR (only when rows are available) ─────────────────────
-        if self._tight_rows_base:
-            btn("Re-run OCR", ('rerun', None), w=90, green=True)
+        all_selected = self.current_selection_index >= len(self.selected_labels)
 
-        # ── Hints (right-aligned) ─────────────────────────────────────────
-        hint = (f"Zoom {self.zoom:.1f}×   "
-                "Scroll=zoom  Mid-drag=pan  "
-                "[/]=±1°  ,/.=±0.1°  R=reset")
-        hs = self.font.render(hint, True, (100, 100, 100))
-        self.screen.blit(hs, (SCREEN_WIDTH - hs.get_width() - 10,
-                               by + (bh - hs.get_height()) // 2))
+        if all_selected:
+            sep()
+            if self._detecting:
+                # ── Busy indicator ────────────────────────────────────────
+                sec("OCR")
+                ds = self.font_b.render("Detecting…", True, YELLOW)
+                self.screen.blit(ds, (x, by + (bh - ds.get_height()) // 2))
+                x += ds.get_width() + 8
+
+            elif self._tight_rows_base:
+                # ── Row count ─────────────────────────────────────────────
+                sec("N ROWS")
+                btn("−", ('uniform_n', -1), w=26)
+                val(f"{self._uniform_n}", (220, 180, 100))
+                btn("+", ('uniform_n', +1), w=26)
+
+                sep()
+
+                # ── Shift block up / down ─────────────────────────────────
+                sec("SHIFT")
+                btn("↑↑", ('shift_rows', -5), w=30)
+                btn("↑",  ('shift_rows', -1), w=26)
+                btn("↓",  ('shift_rows', +1), w=26)
+                btn("↓↓", ('shift_rows', +5), w=30)
+
+                sep()
+
+                # ── Run OCR ───────────────────────────────────────────────
+                sec("OCR")
+                btn("Run OCR", ('rerun', None), w=76, green=True)
+
+        # ── Zoom (right-aligned) ──────────────────────────────────────────
+        zs = self.font_b.render(f"Zoom {self.zoom:.1f}×", True, SEC_CLR)
+        self.screen.blit(zs, (SCREEN_WIDTH - zs.get_width() - 12,
+                               by + (bh - zs.get_height()) // 2))
 
     # ── draw ───────────────────────────────────────────────────────────────
 
@@ -605,32 +819,59 @@ class RectSelector:
                                      (self.image_rect.left, ay),
                                      (self.image_rect.right, ay), 1)
 
-            # Cyan row boxes (inset by row_pad to show actual OCR crop)
+            # Row boxes — alternating colors, numbered
             if self.row_boundaries and self.rectangles:
                 sx1 = int(self.image_rect.left + min(r[0] for r in self.rectangles)*self.zoom)
                 sx2 = int(self.image_rect.left + max(r[2] for r in self.rectangles)*self.zoom)
                 pad_s = self.row_pad * self.zoom
+                w_box = max(1, sx2 - sx1)
 
-                for by1, by2 in self.row_boundaries:
+                for i, (by1, by2) in enumerate(self.row_boundaries):
                     ay1 = int(self.image_rect.top + by1 * self.zoom + pad_s)
                     ay2 = int(self.image_rect.top + by2 * self.zoom - pad_s)
                     if ay2 <= ay1:
                         continue
-                    fill = pygame.Surface((sx2 - sx1, ay2 - ay1), pygame.SRCALPHA)
-                    fill.fill((0, 200, 210, 22))
+                    h_box = ay2 - ay1
+                    fill = pygame.Surface((w_box, h_box), pygame.SRCALPHA)
+                    fill.fill(ROW_FILLS[i % 2])
                     self.screen.blit(fill, (sx1, ay1))
-                    pygame.draw.line(self.screen, CYAN, (sx1, ay1), (sx2, ay1), 1)
-                    pygame.draw.line(self.screen, CYAN, (sx1, ay2), (sx2, ay2), 1)
+                    bc = ROW_BORDERS[i % 2]
+                    pygame.draw.line(self.screen, bc, (sx1, ay1), (sx2, ay1), 2)
+                    pygame.draw.line(self.screen, bc, (sx1, ay2), (sx2, ay2), 2)
+                    pygame.draw.line(self.screen, bc, (sx1, ay1), (sx1, ay2), 1)
+                    pygame.draw.line(self.screen, bc, (sx2, ay1), (sx2, ay2), 1)
+                    # Row number badge
+                    num_s = self.font_s.render(str(i + 1), True, bc)
+                    bw, bh2 = num_s.get_width() + 6, num_s.get_height() + 2
+                    badge = pygame.Surface((bw, bh2), pygame.SRCALPHA)
+                    badge.fill((0, 0, 0, 150))
+                    self.screen.blit(badge, (sx1 + 2, ay1 + 1))
+                    self.screen.blit(num_s, (sx1 + 5, ay1 + 2))
 
-            # Column rectangles
+            # Column rectangles — filled badge label, thicker border
             for bx1, by1, bx2, by2, label in self.rectangles:
                 ax1, ay1 = self._base_to_screen(bx1, by1)
                 ax2, ay2 = self._base_to_screen(bx2, by2)
                 c = LABEL_COLORS.get(label, (128, 128, 128))
+                # Semi-transparent fill
+                col_fill = pygame.Surface((ax2 - ax1, ay2 - ay1), pygame.SRCALPHA)
+                col_fill.fill((*c, 18))
+                self.screen.blit(col_fill, (ax1, ay1))
+                # 2px border
                 pygame.draw.rect(self.screen, c,
-                                 pygame.Rect(ax1, ay1, ax2-ax1, ay2-ay1), 2)
-                self.screen.blit(self.font.render(label, True, c),
-                                 (ax1, max(0, ay1 - 20)))
+                                 pygame.Rect(ax1, ay1, ax2 - ax1, ay2 - ay1), 2,
+                                 border_radius=2)
+                # Label badge above the column box
+                lbl_s  = self.font_b.render(label, True, (255, 255, 255))
+                bw     = lbl_s.get_width() + 10
+                bh2    = lbl_s.get_height() + 4
+                badge_y = max(0, ay1 - bh2)
+                badge   = pygame.Surface((bw, bh2), pygame.SRCALPHA)
+                badge.fill((*c, 210))
+                pygame.draw.rect(badge, (255, 255, 255, 60),
+                                 pygame.Rect(0, 0, bw, bh2), 1, border_radius=3)
+                self.screen.blit(badge, (ax1, badge_y))
+                self.screen.blit(lbl_s, (ax1 + 5, badge_y + 2))
 
             # Live drag preview
             if self.drag_rect:
@@ -649,11 +890,14 @@ class RectSelector:
             lines = [f"Step {idx+1}/3 — Drag LEFT → RIGHT for "
                      f"'{self.selected_labels[idx]}' column.",
                      "Height is locked (yellow lines)."]
+        elif self._detecting:
+            lines = ["Detecting rows… please wait."]
+        elif not self._tight_rows_base:
+            lines = ["All columns selected — detecting rows…"]
         else:
             n = len(self.row_boundaries)
-            lines = [f"OCR complete — {n} row(s) detected.",
-                     "Adjust Row H to expand/shrink all rows, then Re-run OCR.",
-                     "Cyan lines show the actual OCR crop (Gap inset applied)."]
+            lines = [f"{n} row(s) detected.  Fine-tune with Row H / Rows ↑↓, then press Run OCR.",
+                     "Cyan lines = actual OCR crop after Gap inset.  Re-run = OCR only, no re-detect."]
 
         y = 10
         for line in lines:
@@ -702,11 +946,22 @@ class RectSelector:
                                 kind, val = action
                                 if kind == 'rotate':
                                     self._apply_rotation(val)
+                                elif kind == 'auto_deskew':
+                                    self._apply_auto_deskew()
                                 elif kind == 'row_h':
                                     self.row_height_add += val
                                     self._update_row_boundaries()
                                 elif kind == 'pad':
                                     self.row_pad = max(0, self.row_pad + val)
+                                elif kind == 'shift_rows':
+                                    self._shift_rows(val)
+                                elif kind == 'uniform_n':
+                                    self._uniform_n = max(1, self._uniform_n + val)
+                                    self._update_row_boundaries()
+                                elif kind == 'run_ocr':
+                                    threading.Thread(
+                                        target=self._run_ocr_then_show, daemon=True
+                                    ).start()
                                 elif kind == 'rerun':
                                     threading.Thread(
                                         target=self._rerun_ocr, daemon=True
